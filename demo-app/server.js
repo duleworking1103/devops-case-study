@@ -31,8 +31,7 @@ const server = http.createServer((req, res) => {
             Environment: deployEnv,
             service: serviceName,
             version: appVersion,
-            // Ẩn bớt secret để đảm bảo an toàn
-            secret_api: secretUrl.substring(0, 5) + "****" 
+            secret_api: secretUrl 
         }
     };
     
