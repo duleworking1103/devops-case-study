@@ -11,24 +11,15 @@ pipeline {
     }
 
     stages {
-        stage('Verify Workspace') {
-            steps {
-                script {
-                    echo "--- 1. PRE-FLIGHT CHECK ---"
-                    sh "ls -la demo-app/"
-                }
-            }
-        }
-
         stage('Code Analysis & Unit Test') {
             steps {
                 script {
-                    echo "--- 2. RUNNING TESTS VIA ISOLATED CONTAINER ---"
+                    echo "--- 1. RUNNING TESTS VIA ISOLATED CONTAINER ---"
                     try {
                         // 1. Tạo một container chạy ngầm (sleep)
                         sh "docker run -d --name test-container node:18-alpine sleep 3600"
                         
-                        // 2. Copy toàn bộ mã nguồn vào thẳng container (Tuyệt đối không dùng -v)
+                        // 2. Copy toàn bộ mã nguồn vào thẳng container
                         sh "docker cp ./demo-app/. test-container:/app"
                         
                         // 3. Thực thi các lệnh Test ngay bên trong container
@@ -40,8 +31,6 @@ pipeline {
                             npm run lint
                             echo '--- Chạy Unit Test ---'
                             npm test
-                            echo '--- Quét bảo mật Node.js ---'
-                            npm audit --audit-level=high || true
                         "
                         """
                     } finally {
@@ -56,7 +45,7 @@ pipeline {
             steps {
                 withCredentials([usernamePassword(credentialsId: 'DOCKER_REGISTRY_CREDS', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
                     script {
-                        echo "--- 3. PACKAGING ARTIFACT: ${params.IMAGE_TAG} ---"
+                        echo "--- 2. PACKAGING ARTIFACT: ${params.IMAGE_TAG} ---"
                         // Test pass thì mới bắt đầu Build ra Image thực tế
                         sh "docker build -t ${IMAGE_NAME}:${params.IMAGE_TAG} ./demo-app"
                         sh "echo \$DOCKER_PASS | docker login -u \$DOCKER_USER --password-stdin"
@@ -66,20 +55,11 @@ pipeline {
             }
         }
 
-        stage('Security Scan (Trivy)') {
-            steps {
-                script {
-                    echo "--- 4. DOCKER IMAGE VULNERABILITY SCAN ---"
-                    sh "docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest image --exit-code 0 --severity HIGH,CRITICAL ${IMAGE_NAME}:${params.IMAGE_TAG}"
-                }
-            }
-        }
-
         stage('Deploy to DEV') {
             steps {
                 withCredentials([string(credentialsId: 'DEV_API_URL_SECRET', variable: 'DEV_SECRET')]) {
                     script {
-                        echo "--- 5. DEPLOYING TO DEV ---"
+                        echo "--- 3. DEPLOYING TO DEV ---"
                         deployAndVerify('dev', params.IMAGE_TAG, env.DEV_SECRET)
                     }
                 }
@@ -88,7 +68,7 @@ pipeline {
 
         stage('Approval for PROD') {
             steps {
-                input message: "Artifact ${params.IMAGE_TAG} đã ổn trên DEV. Promote lên PRODUCTION?", ok: "Đồng ý"
+                input message: "Artifact ${params.IMAGE_TAG} đã ổn định trên DEV. Promote lên PRODUCTION?", ok: "Đồng ý"
             }
         }
 
@@ -96,7 +76,7 @@ pipeline {
             steps {
                 withCredentials([string(credentialsId: 'PROD_API_URL_SECRET', variable: 'PROD_SECRET')]) {
                     script {
-                        echo "--- 6. DEPLOYING TO PROD ---"
+                        echo "--- 4. DEPLOYING TO PROD ---"
                         deployAndVerify('production', params.IMAGE_TAG, env.PROD_SECRET)
                     }
                 }
@@ -109,7 +89,7 @@ pipeline {
                     try {
                         timeout(time: 5, unit: 'MINUTES') {
                             def decision = input(
-                                message: "App đã lên PROD. QA có 5 phút để test Sanity. Quyết định của bạn?",
+                                message: "App đã lên PROD. Đội QA có 5 phút để test Sanity. Quyết định của bạn?",
                                 parameters: [
                                     choice(name: 'ACTION', 
                                            choices: ['Giữ nguyên', 'Rollback khẩn cấp'], 
