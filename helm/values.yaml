@@ -165,3 +165,6 @@ appConfig:
   appVersion: ""
   secretApiUrl: ""
   environment: ""
+  env:
+    - name: APP_MODE
+      value: ""
