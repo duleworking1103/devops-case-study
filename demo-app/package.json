@@ -1,0 +1,10 @@
+{
+  "name": "devops-case-study-app",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "lint": "echo '✅ Code style check passed!'",
+    "test": "if [ \"$TEST_MODE\" = \"fail\" ]; then echo '❌ Mock Test Failed!'; exit 1; else echo '✅ Mock Test Passed!'; exit 0; fi"
+  }
+}
