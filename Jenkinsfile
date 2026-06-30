@@ -11,16 +11,6 @@ pipeline {
         IMAGE_NAME = 'dule1103/demo-app'
     }
 
-    stages {
-        stage('Checkout Source Code') {
-            steps {
-                script {
-                    echo "--- 1. PULLING SOURCE CODE FROM GITHUB ---"
-                    checkout scm
-                }
-            }
-        }
-
         stage('Test & Validation') {
             steps {
                 script {
