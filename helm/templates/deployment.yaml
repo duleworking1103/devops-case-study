@@ -45,6 +45,8 @@ spec:
               containerPort: {{ .Values.service.port }}
               protocol: TCP
           env:
+           - name: APP_MODE
+             value: {{ .Values.appConfig.appMode | quote }}
            - name: SERVICE_NAME
              value: {{ .Values.appConfig.serviceName | quote }}
            - name: APP_VERSION
