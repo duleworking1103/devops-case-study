@@ -1,17 +1,14 @@
 pipeline {
-    // Chạy trên Agent mà chúng ta đã setup
     agent { label 'docker-agent' } 
 
-    // 1. KHAI BÁO THAM SỐ (Parameters)
-    // Cho phép người dùng chọn tag và môi trường khi nhấn "Build with Parameters"
     parameters {
-        string(name: 'IMAGE_TAG', defaultValue: "v1.0.0", description: 'Nhập Tag cho Docker Image (VD: v1.0.2)')
+        string(name: 'IMAGE_TAG', defaultValue: "v1.0.0", description: 'Nhập Tag cho Docker Image')
         choice(name: 'DEPLOY_ENV', choices: ['dev', 'staging', 'production'], description: 'Chọn môi trường triển khai')
     }
 
     environment {
-        // LƯU Ý: Đổi 'your_dockerhub_username' thành username Docker Hub thực tế của bạn
-        IMAGE_NAME = 'your_dockerhub_username/my-demo-app'
+        // Thay bằng username Docker Hub của bạn
+        IMAGE_NAME = 'dule1103/demo-app'
     }
 
     stages {
@@ -19,7 +16,6 @@ pipeline {
             steps {
                 script {
                     echo "--- 1. PULLING SOURCE CODE FROM GITHUB ---"
-                    // Tự động kéo code từ repo GitHub dựa trên cấu hình Job trong Jenkins
                     checkout scm
                 }
             }
@@ -28,8 +24,7 @@ pipeline {
         stage('Test & Validation') {
             steps {
                 script {
-                    echo "--- 2. RUNNING TESTS FOR ENV: ${params.DEPLOY_ENV} ---"
-                    // Test cơ bản kiểm tra cú pháp file Node.js
+                    echo "--- 2. RUNNING TESTS ---"
                     sh "node --check ./demo-app/server.js"
                 }
             }
@@ -37,14 +32,10 @@ pipeline {
 
         stage('Build & Push Docker Image') {
             steps {
-                // Tích hợp Secret Manager cho Docker Registry
                 withCredentials([usernamePassword(credentialsId: 'DOCKER_REGISTRY_CREDS', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
                     script {
-                        echo "--- 3. BUILD DOCKER IMAGE ---"
+                        echo "--- 3. BUILD & PUSH IMAGE ---"
                         sh "docker build -t ${IMAGE_NAME}:${params.IMAGE_TAG} ./demo-app"
-                        
-                        echo "--- 4. LOGIN & PUSH TO REGISTRY ---"
-                        // Dùng --password-stdin để bảo mật mật khẩu, không lưu vào lịch sử bash
                         sh "echo \$DOCKER_PASS | docker login -u \$DOCKER_USER --password-stdin"
                         sh "docker push ${IMAGE_NAME}:${params.IMAGE_TAG}"
                     }
@@ -52,43 +43,66 @@ pipeline {
             }
         }
 
-        stage('Deploy to Kubernetes (Helm)') {
+        stage('Deploy & Auto-Rollback (Helm)') {
             steps {
-                // Tích hợp Secret Manager cho API Secret của ứng dụng
                 withCredentials([string(credentialsId: 'API_URL_SECRET', variable: 'SECRET_URL')]) {
                     script {
-                        echo "--- 5. DEPLOYING VERSION ${params.IMAGE_TAG} TO ${params.DEPLOY_ENV} ---"
+                        echo "--- 4. DEPLOYING TO ${params.DEPLOY_ENV} ---"
                         
-                        // Sử dụng Helm để Deploy/Rolling Update với các thông số truyền vào động
-                        sh """
-                        helm upgrade --install demo-app-${params.DEPLOY_ENV} ./helm \
-                            --set image.repository=${IMAGE_NAME} \
-                            --set image.tag=${params.IMAGE_TAG} \
-                            --set appConfig.appVersion=${params.IMAGE_TAG} \
-                            --set appConfig.environment=${params.DEPLOY_ENV} \
-                            --set appConfig.secretApiUrl=\$SECRET_URL \
-                            --wait --timeout 2m
-                        """
+                        // SỬ DỤNG TRY-CATCH ĐỂ XỬ LÝ LỖI TRIỂN KHAI VÀ ROLLBACK
+                        try {
+                            // Cờ --wait và --timeout rất quan trọng: 
+                            // Nếu Pod bị CrashLoopBackOff, lệnh helm này sẽ fail sau 2 phút và nhảy xuống khối catch
+                            sh """
+                            helm upgrade --install demo-app-${params.DEPLOY_ENV} ./helm \
+                                --set image.repository=${IMAGE_NAME} \
+                                --set image.tag=${params.IMAGE_TAG} \
+                                --set appConfig.appVersion=${params.IMAGE_TAG} \
+                                --set appConfig.environment=${params.DEPLOY_ENV} \
+                                --set appConfig.secretApiUrl=\$SECRET_URL \
+                                --wait --timeout 2m
+                            """
+                        } catch (Exception e) {
+                            echo "⚠️ LỖI: Triển khai thất bại (Timeout hoặc Crash). Đang tiến hành ROLLBACK..."
+                            
+                            // Lệnh Rollback về revision trước đó (0 có nghĩa là bản ổn định gần nhất)
+                            sh "helm rollback demo-app-${params.DEPLOY_ENV} 0"
+                            
+                            // Báo lỗi để Pipeline dừng lại và chuyển sang trạng thái FAILED
+                            error("Deployment failed! Đã Rollback an toàn về phiên bản trước đó. Chi tiết lỗi: ${e.getMessage()}")
+                        }
                     }
                 }
             }
         }
     }
 
-    // Xử lý sau khi chạy Pipeline (Error Handling & Cleanup)
+    // XỬ LÝ FAILURE BÀI BẢN
     post {
         always {
-            echo "--- CLEANING UP WORKSPACE ---"
-            // Xóa credentials phiên đăng nhập Docker để đảm bảo an toàn cho Agent
+            echo "--- DỌN DẸP AGENT ---"
             sh "docker logout || true"
         }
         success {
             echo "✅ PIPELINE SUCCESS!"
-            echo "Successfully deployed ${IMAGE_NAME}:${params.IMAGE_TAG} to ${params.DEPLOY_ENV} environment."
+            echo "Phiên bản ${params.IMAGE_TAG} đang chạy ổn định trên môi trường ${params.DEPLOY_ENV}."
+            
+            // Mock: Gửi thông báo thành công
+            sh """
+            echo "MOCK ALERT: Gửi tin nhắn Slack -> 🟢 [Thành công] Version #${params.IMAGE_TAG} đã deploy lên ${params.DEPLOY_ENV}."
+            """
         }
         failure {
             echo "❌ PIPELINE FAILED!"
-            echo "Triggering alert notifications to the engineering team..."
+            
+            // Mock: Gửi cảnh báo lỗi và tag team Dev
+            sh """
+            echo "MOCK ALERT: Gửi tin nhắn Slack -> 🔴 [Thất bại] Version #${params.IMAGE_TAG} lỗi! Vui lòng kiểm tra log Jenkins."
+            echo "MOCK TICKET: Tự động tạo Jira Ticket assign cho team Developer."
+            """
+        }
+        aborted {
+            echo "⚠️ Pipeline bị người dùng hủy giữa chừng."
         }
     }
 }
