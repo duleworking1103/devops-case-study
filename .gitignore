@@ -1,0 +1,6 @@
+jenkins_home/
+.DS_Store
+*~
+.vscode/
+.idea/
+*.tar

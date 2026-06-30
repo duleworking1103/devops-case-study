@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  jenkins-controller:
+    image: jenkins/jenkins:lts-jdk17
+    container_name: jenkins-controller
+    ports:
+      - "8080:8080"
+      - "50000:50000"
+    volumes:
+      - ./jenkins_home:/var/jenkins_home
+      # Mount config K3s để Jenkins có quyền điều khiển cluster
+      - /etc/rancher/k3s/k3s.yaml:/var/jenkins_home/.kube/config:ro
+    network_mode: host
+
+  jenkins-agent:
+    image: jenkins/inbound-agent:jdk17
+    container_name: jenkins-agent
+    environment:
+      - JENKINS_URL=http://10.0.0.11:8080
+      - JENKINS_SECRET=8e885b013c5140baa6fa41456cd270e584e61e705ae14aed1668028f296b947a
+      - JENKINS_AGENT_NAME=docker-agent
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock # Để build được Docker Image
+      - /etc/rancher/k3s/k3s.yaml:/home/jenkins/.kube/config:ro # Để dùng được kubectl/helm
+      - /usr/local/bin/kubectl:/usr/local/bin/kubectl:ro
+      - /usr/sbin/helm:/usr/local/bin/helm:ro
+      - /usr/bin/docker:/usr/bin/docker:ro
+    network_mode: host
+    depends_on:
+      - jenkins-controller
