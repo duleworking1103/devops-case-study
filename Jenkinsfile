@@ -2,7 +2,7 @@ pipeline {
     agent { label 'docker-agent' } 
 
     parameters {
-        string(name: 'IMAGE_TAG', defaultValue: 'v1.0.0', description: 'Nhập Tag (ví dụ: v1.0.1)')
+        string(name: 'IMAGE_TAG', defaultValue: 'v1.0.0', description: 'Nhập Tag cố định cho lần Build & Deploy này')
         choice(name: 'TEST_MODE', choices: ['pass', 'fail'], description: 'Giả lập kết quả Unit Test')
     }
 
@@ -15,9 +15,10 @@ pipeline {
             steps {
                 script {
                     echo "--- 1. PRE-FLIGHT CHECK ---"
-                    sh "ls -la demo-app/"
-                    sh "chmod -R 755 demo-app/"
-                    sh "cat demo-app/package.json"
+                    // Kiểm tra xem file thực sự nằm ở đâu
+                    sh "ls -la ${WORKSPACE}/demo-app/"
+                    // Fix quyền để container đọc được file
+                    sh "chmod -R 755 ${WORKSPACE}/demo-app/"
                 }
             }
         }
@@ -26,12 +27,19 @@ pipeline {
             steps {
                 script {
                     echo "--- 2. RUNNING LINT & TESTS (Mode: ${params.TEST_MODE}) ---"
+                    // Sử dụng ${WORKSPACE} thay vì $(pwd) để tránh lỗi đường dẫn tuyệt đối trên Jenkins
                     sh """
-                    docker run --rm -e TEST_MODE=${params.TEST_MODE} -v \$(pwd)/demo-app:/app -w /app node:18-alpine sh -c "
-                        npm install
-                        npm run lint
-                        npm test
-                    "
+                    docker run --rm \
+                        -e TEST_MODE=${params.TEST_MODE} \
+                        -v ${WORKSPACE}/demo-app:/app \
+                        -w /app \
+                        node:18-alpine sh -c "
+                            echo '--- Nội dung bên trong container ---'
+                            ls -la /app
+                            npm install
+                            npm run lint
+                            npm test
+                        "
                     """
                 }
             }
@@ -40,8 +48,8 @@ pipeline {
         stage('Security Scan') {
             steps {
                 script {
-                    echo "--- 3. SECURITY & VULNERABILITY SCAN ---"
-                    sh "docker run --rm -v \$(pwd)/demo-app:/app -w /app node:18-alpine sh -c 'npm audit --audit-level=high || true'"
+                    echo "--- 3. SECURITY SCAN ---"
+                    sh "docker run --rm -v ${WORKSPACE}/demo-app:/app -w /app node:18-alpine sh -c 'npm audit --audit-level=high || true'"
                     sh "docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest image --exit-code 0 --severity HIGH,CRITICAL ${IMAGE_NAME}:${params.IMAGE_TAG}"
                 }
             }
@@ -52,7 +60,7 @@ pipeline {
                 withCredentials([usernamePassword(credentialsId: 'DOCKER_REGISTRY_CREDS', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
                     script {
                         echo "--- 4. PACKAGING ARTIFACT: ${params.IMAGE_TAG} ---"
-                        sh "docker build -t ${IMAGE_NAME}:${params.IMAGE_TAG} ./demo-app"
+                        sh "docker build -t ${IMAGE_NAME}:${params.IMAGE_TAG} ${WORKSPACE}/demo-app"
                         sh "echo \$DOCKER_PASS | docker login -u \$DOCKER_USER --password-stdin"
                         sh "docker push ${IMAGE_NAME}:${params.IMAGE_TAG}"
                     }
@@ -85,23 +93,6 @@ pipeline {
                 }
             }
         }
-
-        stage('Manual Rollback (PROD)') {
-            steps {
-                script {
-                    timeout(time: 5, unit: 'MINUTES') {
-                        def decision = input(
-                            message: "App đã lên PROD. QA có 5 phút kiểm tra. Bạn quyết định thế nào?",
-                            parameters: [choice(name: 'ACTION', choices: ['Giữ nguyên', 'Rollback khẩn cấp'], description: 'Chọn hành động')]
-                        )
-                        if (decision == 'Rollback khẩn cấp') {
-                            sh "helm rollback demo-app-production 0"
-                            error("Manual Rollback Triggered!")
-                        }
-                    }
-                }
-            }
-        }
     }
 
     post {
@@ -123,8 +114,8 @@ def deployAndVerify(envName, tag, secretUrl) {
             --wait --timeout 2m
         """
     } catch (Exception e) {
-        echo "⚠️ LỖI KỸ THUẬT: Đang AUTO-ROLLBACK..."
+        echo "⚠️ LỖI: Auto-Rollback triggered..."
         sh "helm rollback demo-app-${envName} 0"
-        error("Auto-Rollback triggered!")
+        error("Deployment failed at ${envName}")
     }
 }
