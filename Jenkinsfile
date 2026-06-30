@@ -25,7 +25,7 @@ pipeline {
             steps {
                 script {
                     echo "--- 2. RUNNING TESTS ---"
-                    sh "node --check ./demo-app/server.js"
+                    sh "cat ./demo-app/server.js | docker run --rm -i node:18-alpine node --check"
                 }
             }
         }
