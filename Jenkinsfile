@@ -2,8 +2,7 @@ pipeline {
     agent { label 'docker-agent' } 
 
     parameters {
-        // Bạn sẽ tự nhập Tag (ví dụ: v1.0.0, v1.0.1) vào đây mỗi khi chạy Build
-        string(name: 'IMAGE_TAG', defaultValue: 'v1.0.0', description: 'Nhập Tag cố định cho lần Build & Deploy này')
+        string(name: 'IMAGE_TAG', defaultValue: 'v1.0.0', description: 'Nhập Tag (ví dụ: v1.0.1)')
         choice(name: 'TEST_MODE', choices: ['pass', 'fail'], description: 'Giả lập kết quả Unit Test')
     }
 
@@ -12,10 +11,21 @@ pipeline {
     }
 
     stages {
+        stage('Verify Workspace') {
+            steps {
+                script {
+                    echo "--- 1. PRE-FLIGHT CHECK ---"
+                    sh "ls -la demo-app/"
+                    sh "chmod -R 755 demo-app/"
+                    sh "cat demo-app/package.json"
+                }
+            }
+        }
+
         stage('Code Analysis & Unit Test') {
             steps {
                 script {
-                    echo "--- 1. RUNNING LINT & TESTS (Mode: ${params.TEST_MODE}) ---"
+                    echo "--- 2. RUNNING LINT & TESTS (Mode: ${params.TEST_MODE}) ---"
                     sh """
                     docker run --rm -e TEST_MODE=${params.TEST_MODE} -v \$(pwd)/demo-app:/app -w /app node:18-alpine sh -c "
                         npm install
@@ -27,12 +37,12 @@ pipeline {
             }
         }
 
-        stage('Security Scan (SAST)') {
+        stage('Security Scan') {
             steps {
                 script {
-                    echo "--- 2. NPM AUDIT (Code Security Check) ---"
-                    // Quét thư viện npm, nếu có lỗi High sẽ in ra cảnh báo (dùng || true để không block pipeline trong lúc demo)
+                    echo "--- 3. SECURITY & VULNERABILITY SCAN ---"
                     sh "docker run --rm -v \$(pwd)/demo-app:/app -w /app node:18-alpine sh -c 'npm audit --audit-level=high || true'"
+                    sh "docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest image --exit-code 0 --severity HIGH,CRITICAL ${IMAGE_NAME}:${params.IMAGE_TAG}"
                 }
             }
         }
@@ -41,7 +51,7 @@ pipeline {
             steps {
                 withCredentials([usernamePassword(credentialsId: 'DOCKER_REGISTRY_CREDS', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
                     script {
-                        echo "--- 3. PACKAGING ARTIFACT: ${params.IMAGE_TAG} ---"
+                        echo "--- 4. PACKAGING ARTIFACT: ${params.IMAGE_TAG} ---"
                         sh "docker build -t ${IMAGE_NAME}:${params.IMAGE_TAG} ./demo-app"
                         sh "echo \$DOCKER_PASS | docker login -u \$DOCKER_USER --password-stdin"
                         sh "docker push ${IMAGE_NAME}:${params.IMAGE_TAG}"
@@ -50,22 +60,10 @@ pipeline {
             }
         }
 
-        stage('Vulnerability Scan (Trivy)') {
-            steps {
-                script {
-                    echo "--- 4. DOCKER IMAGE VULNERABILITY SCAN ---"
-                    // Quét image bằng Trivy. (Set exit-code 0 để pipeline chạy tiếp phục vụ demo, thực tế nên là exit-code 1)
-                    sh "docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest image --exit-code 0 --severity HIGH,CRITICAL ${IMAGE_NAME}:${params.IMAGE_TAG}"
-                }
-            }
-        }
-
         stage('Deploy to DEV') {
             steps {
-                // Sử dụng Secret dành riêng cho môi trường DEV
                 withCredentials([string(credentialsId: 'DEV_API_URL_SECRET', variable: 'DEV_SECRET')]) {
                     script {
-                        echo "--- 5. DEPLOYING ARTIFACT ${params.IMAGE_TAG} TO DEV ---"
                         deployAndVerify('dev', params.IMAGE_TAG, env.DEV_SECRET)
                     }
                 }
@@ -74,20 +72,14 @@ pipeline {
 
         stage('Approval for PROD') {
             steps {
-                script {
-                    // Dừng luồng Pipeline chờ phê duyệt
-                    input message: "Artifact ${params.IMAGE_TAG} đã Deploy lên DEV. Bạn có chắc chắn muốn Promote lên PRODUCTION không?", 
-                          ok: "Đồng ý Promote"
-                }
+                input message: "Artifact ${params.IMAGE_TAG} đã ổn trên DEV. Đẩy lên PRODUCTION?", ok: "Đồng ý"
             }
         }
 
         stage('Deploy to PROD') {
             steps {
-                // Sử dụng Secret dành riêng cho môi trường PROD
                 withCredentials([string(credentialsId: 'PROD_API_URL_SECRET', variable: 'PROD_SECRET')]) {
                     script {
-                        echo "--- 6. DEPLOYING ARTIFACT ${params.IMAGE_TAG} TO PROD ---"
                         deployAndVerify('production', params.IMAGE_TAG, env.PROD_SECRET)
                     }
                 }
@@ -97,31 +89,15 @@ pipeline {
         stage('Manual Rollback (PROD)') {
             steps {
                 script {
-                    echo "--- 7. POST-DEPLOYMENT VERIFICATION ---"
-                    try {
-                        // Đợi tối đa 5 phút để QA test ứng dụng
-                        timeout(time: 5, unit: 'MINUTES') {
-                            def decision = input(
-                                message: "App đã lên PROD. Đội QA có 5 phút để test Sanity. Bạn quyết định thế nào?",
-                                parameters: [
-                                    choice(name: 'ACTION', 
-                                           choices: ['Giữ nguyên (Phiên bản tốt)', 'Rollback khẩn cấp (Lỗi logic)'], 
-                                           description: 'Chọn hành động sau khi kiểm tra thực tế')
-                                ]
-                            )
-                            
-                            // Thực thi lệnh dựa trên lựa chọn
-                            if (decision == 'Rollback khẩn cấp (Lỗi logic)') {
-                                echo "⚠️ NHẬN LỆNH ROLLBACK THỦ CÔNG TỪ ADMIN! Đang khôi phục..."
-                                sh "helm rollback demo-app-production 0"
-                                error("Manual Rollback Triggered by Admin due to Business Logic Error") 
-                            } else {
-                                echo "✅ XÁC NHẬN PHIÊN BẢN ỔN ĐỊNH. KẾT THÚC PIPELINE!"
-                            }
+                    timeout(time: 5, unit: 'MINUTES') {
+                        def decision = input(
+                            message: "App đã lên PROD. QA có 5 phút kiểm tra. Bạn quyết định thế nào?",
+                            parameters: [choice(name: 'ACTION', choices: ['Giữ nguyên', 'Rollback khẩn cấp'], description: 'Chọn hành động')]
+                        )
+                        if (decision == 'Rollback khẩn cấp') {
+                            sh "helm rollback demo-app-production 0"
+                            error("Manual Rollback Triggered!")
                         }
-                    } catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException e) {
-                        // Hết timeout 5 phút hoặc ai đó ấn Abort
-                        echo "⏳ Hết 5 phút kiểm tra hoặc bỏ qua thao tác. Mặc định hệ thống giữ nguyên bản mới nhất."
                     }
                 }
             }
@@ -129,20 +105,12 @@ pipeline {
     }
 
     post {
-        always {
-            sh "docker logout || true"
-            echo "--- CLEANING UP WORKSPACE ---"
-        }
-        success {
-            echo "✅ PIPELINE SUCCESS!"
-        }
-        failure {
-            echo "❌ PIPELINE FAILED!"
-        }
+        always { sh "docker logout || true" }
+        success { echo "✅ PIPELINE SUCCESS!" }
+        failure { echo "❌ PIPELINE FAILED!" }
     }
 }
 
-// Hàm thực thi Deploy & Auto-Rollback (Lỗi kỹ thuật)
 def deployAndVerify(envName, tag, secretUrl) {
     try {
         sh """
@@ -155,8 +123,8 @@ def deployAndVerify(envName, tag, secretUrl) {
             --wait --timeout 2m
         """
     } catch (Exception e) {
-        echo "⚠️ LỖI KỸ THUẬT TẠI ${envName.toUpperCase()}: Đang AUTO-ROLLBACK..."
+        echo "⚠️ LỖI KỸ THUẬT: Đang AUTO-ROLLBACK..."
         sh "helm rollback demo-app-${envName} 0"
-        error("Auto-Rollback triggered at ${envName}! Lỗi: ${e.getMessage()}")
+        error("Auto-Rollback triggered!")
     }
 }
