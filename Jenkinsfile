@@ -2,7 +2,7 @@ pipeline {
     agent { label 'docker-agent' } 
 
     parameters {
-        string(name: 'IMAGE_TAG', defaultValue: 'v1.0.0', description: 'Nhập Tag cố định cho lần Build & Deploy này')
+        string(name: 'IMAGE_TAG', defaultValue: 'v1.0.0', description: 'Nhập Tag cố định cho lần Build này')
         choice(name: 'TEST_MODE', choices: ['pass', 'fail'], description: 'Giả lập kết quả Unit Test')
     }
 
@@ -15,10 +15,7 @@ pipeline {
             steps {
                 script {
                     echo "--- 1. PRE-FLIGHT CHECK ---"
-                    // Kiểm tra xem file thực sự nằm ở đâu
-                    sh "ls -la ${WORKSPACE}/demo-app/"
-                    // Fix quyền để container đọc được file
-                    sh "chmod -R 755 ${WORKSPACE}/demo-app/"
+                    sh "ls -la demo-app/"
                 }
             }
         }
@@ -26,31 +23,31 @@ pipeline {
         stage('Code Analysis & Unit Test') {
             steps {
                 script {
-                    echo "--- 2. RUNNING LINT & TESTS (Mode: ${params.TEST_MODE}) ---"
-                    // Sử dụng ${WORKSPACE} thay vì $(pwd) để tránh lỗi đường dẫn tuyệt đối trên Jenkins
-                    sh """
-                    docker run --rm \
-                        -e TEST_MODE=${params.TEST_MODE} \
-                        -v ${WORKSPACE}/demo-app:/app \
-                        -w /app \
-                        node:18-alpine sh -c "
-                            echo '--- Nội dung bên trong container ---'
-                            ls -la /app
+                    echo "--- 2. RUNNING TESTS VIA ISOLATED CONTAINER ---"
+                    try {
+                        // 1. Tạo một container chạy ngầm (sleep)
+                        sh "docker run -d --name test-container node:18-alpine sleep 3600"
+                        
+                        // 2. Copy toàn bộ mã nguồn vào thẳng container (Tuyệt đối không dùng -v)
+                        sh "docker cp ./demo-app/. test-container:/app"
+                        
+                        // 3. Thực thi các lệnh Test ngay bên trong container
+                        sh """
+                        docker exec -e TEST_MODE=${params.TEST_MODE} -w /app test-container sh -c "
+                            echo '--- Cài đặt thư viện ---'
                             npm install
+                            echo '--- Chạy Linting ---'
                             npm run lint
+                            echo '--- Chạy Unit Test ---'
                             npm test
+                            echo '--- Quét bảo mật Node.js ---'
+                            npm audit --audit-level=high || true
                         "
-                    """
-                }
-            }
-        }
-
-        stage('Security Scan') {
-            steps {
-                script {
-                    echo "--- 3. SECURITY SCAN ---"
-                    sh "docker run --rm -v ${WORKSPACE}/demo-app:/app -w /app node:18-alpine sh -c 'npm audit --audit-level=high || true'"
-                    sh "docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest image --exit-code 0 --severity HIGH,CRITICAL ${IMAGE_NAME}:${params.IMAGE_TAG}"
+                        """
+                    } finally {
+                        // 4. Luôn dọn dẹp container test dù thành công hay thất bại
+                        sh "docker rm -f test-container || true"
+                    }
                 }
             }
         }
@@ -59,11 +56,21 @@ pipeline {
             steps {
                 withCredentials([usernamePassword(credentialsId: 'DOCKER_REGISTRY_CREDS', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
                     script {
-                        echo "--- 4. PACKAGING ARTIFACT: ${params.IMAGE_TAG} ---"
-                        sh "docker build -t ${IMAGE_NAME}:${params.IMAGE_TAG} ${WORKSPACE}/demo-app"
+                        echo "--- 3. PACKAGING ARTIFACT: ${params.IMAGE_TAG} ---"
+                        // Test pass thì mới bắt đầu Build ra Image thực tế
+                        sh "docker build -t ${IMAGE_NAME}:${params.IMAGE_TAG} ./demo-app"
                         sh "echo \$DOCKER_PASS | docker login -u \$DOCKER_USER --password-stdin"
                         sh "docker push ${IMAGE_NAME}:${params.IMAGE_TAG}"
                     }
+                }
+            }
+        }
+
+        stage('Security Scan (Trivy)') {
+            steps {
+                script {
+                    echo "--- 4. DOCKER IMAGE VULNERABILITY SCAN ---"
+                    sh "docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest image --exit-code 0 --severity HIGH,CRITICAL ${IMAGE_NAME}:${params.IMAGE_TAG}"
                 }
             }
         }
@@ -72,6 +79,7 @@ pipeline {
             steps {
                 withCredentials([string(credentialsId: 'DEV_API_URL_SECRET', variable: 'DEV_SECRET')]) {
                     script {
+                        echo "--- 5. DEPLOYING TO DEV ---"
                         deployAndVerify('dev', params.IMAGE_TAG, env.DEV_SECRET)
                     }
                 }
@@ -80,7 +88,7 @@ pipeline {
 
         stage('Approval for PROD') {
             steps {
-                input message: "Artifact ${params.IMAGE_TAG} đã ổn trên DEV. Đẩy lên PRODUCTION?", ok: "Đồng ý"
+                input message: "Artifact ${params.IMAGE_TAG} đã ổn trên DEV. Promote lên PRODUCTION?", ok: "Đồng ý"
             }
         }
 
@@ -88,7 +96,33 @@ pipeline {
             steps {
                 withCredentials([string(credentialsId: 'PROD_API_URL_SECRET', variable: 'PROD_SECRET')]) {
                     script {
+                        echo "--- 6. DEPLOYING TO PROD ---"
                         deployAndVerify('production', params.IMAGE_TAG, env.PROD_SECRET)
+                    }
+                }
+            }
+        }
+
+        stage('Manual Rollback (PROD)') {
+            steps {
+                script {
+                    try {
+                        timeout(time: 5, unit: 'MINUTES') {
+                            def decision = input(
+                                message: "App đã lên PROD. QA có 5 phút để test Sanity. Quyết định của bạn?",
+                                parameters: [
+                                    choice(name: 'ACTION', 
+                                           choices: ['Giữ nguyên', 'Rollback khẩn cấp'], 
+                                           description: 'Chọn hành động sau khi kiểm tra')
+                                ]
+                            )
+                            if (decision == 'Rollback khẩn cấp') {
+                                sh "helm rollback demo-app-production 0"
+                                error("Manual Rollback Triggered by Admin!") 
+                            }
+                        }
+                    } catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException e) {
+                        echo "⏳ Bỏ qua thao tác Manual Rollback."
                     }
                 }
             }
@@ -114,8 +148,8 @@ def deployAndVerify(envName, tag, secretUrl) {
             --wait --timeout 2m
         """
     } catch (Exception e) {
-        echo "⚠️ LỖI: Auto-Rollback triggered..."
+        echo "⚠️ LỖI KỸ THUẬT TẠI ${envName.toUpperCase()}: AUTO-ROLLBACK..."
         sh "helm rollback demo-app-${envName} 0"
-        error("Deployment failed at ${envName}")
+        error("Auto-Rollback triggered at ${envName}!")
     }
 }
